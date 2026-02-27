@@ -9,6 +9,8 @@ Checks:
       service whose binary path references those names
   5.  Registry key  HKLM\\SOFTWARE\\Imix  (system-id value)
   6.  Realm gRPC network connections on port 8000
+  7.  Process binaries containing embedded Rust/imix dependency strings
+      (rustc, gimli, addr2line, demangle) – indicates imix compiled binary
 """
 from __future__ import annotations
 
@@ -34,6 +36,9 @@ REALM_FINGERPRINTS = re.compile(
     re.IGNORECASE,
 )
 
+# Rust crate strings embedded in imix binaries by the compiler/debug info
+RUST_IMIX_STRINGS: List[bytes] = [b"rustc", b"gimli", b"addr2line", b"demangle"]
+
 
 def _read_text(path: str) -> str:
     try:
@@ -48,6 +53,16 @@ def _is_pe(path: str) -> bool:
     try:
         with open(path, "rb") as fh:
             return fh.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
+def _binary_contains_rust_strings(path: str) -> bool:
+    """Return True if the binary at *path* contains all four Rust/imix strings."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        return all(s in data for s in RUST_IMIX_STRINGS)
     except OSError:
         return False
 
@@ -249,9 +264,69 @@ def check_registry(report: ScanReport) -> None:
         pass  # Running on Linux/macOS during test
 
 
+def check_rust_imix_strings(report: ScanReport) -> None:
+    """
+    Detect process binaries that contain all four Rust/imix dependency strings:
+    'rustc', 'gimli', 'addr2line', 'demangle'.  The simultaneous presence of
+    all four is a strong indicator of an imix compiled binary regardless of
+    the process name.  Uses psutil when available, falls back to WMIC.
+    """
+    seen_exes: set = set()
+
+    def _check_exe(pid: object, name: str, exe: str) -> None:
+        if not exe or exe in seen_exes:
+            return
+        seen_exes.add(exe)
+        if _binary_contains_rust_strings(exe):
+            report.add(Finding(
+                category="process",
+                severity=Severity.HIGH,
+                title=f"Process binary contains Rust/imix dependency strings: {name} (PID {pid})",
+                detail=(
+                    f"Binary '{exe}' contains all of: "
+                    + ", ".join(s.decode() for s in RUST_IMIX_STRINGS)
+                ),
+                path=exe,
+                extra={"pid": pid, "exe": exe, "strings_matched": [s.decode() for s in RUST_IMIX_STRINGS]},
+            ))
+
+    try:
+        import psutil  # type: ignore
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                _check_exe(proc.pid, proc.info.get("name") or "", proc.info.get("exe") or "")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return
+    except ImportError:
+        pass
+
+    # Fallback: WMIC (available on most Windows versions)
+    try:
+        out = subprocess.check_output(
+            ["wmic", "process", "get", "ProcessId,Name,ExecutablePath", "/FORMAT:CSV"],
+            text=True, timeout=20, errors="replace",
+        )
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or line.lower().startswith("node"):
+                continue
+            parts = line.split(",", 3)
+            # CSV columns: Node, ExecutablePath, Name, ProcessId
+            if len(parts) < 4:
+                continue
+            exe = parts[1].strip()
+            name = parts[2].strip()
+            pid = parts[3].strip()
+            _check_exe(pid, name, exe)
+    except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        pass
+
+
 def scan(report: ScanReport) -> None:
     """Run all Windows-specific realm detection checks."""
     check_processes(report)
+    check_rust_imix_strings(report)
     check_host_id_file(report)
     check_binaries(report)
     check_services(report)

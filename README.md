@@ -11,6 +11,7 @@ A cross-platform Python agent that detects and responds to the
 | Artifact | Details |
 |---|---|
 | `imix` / `golem` process | Running implant processes by name |
+| Rust/imix dependency strings in process binary | Binary search for `rustc`, `gimli`, `addr2line`, `demangle` — all four present indicates an imix compiled binary, regardless of process name |
 | Port 8000 connections | Realm's default Tavern gRPC/HTTP C2 port |
 | Tavern server listening locally | TCP connect to `127.0.0.1:8000` |
 
@@ -19,6 +20,7 @@ A cross-platform Python agent that detects and responds to the
 |---|---|
 | Host-ID beacon UUID | `/var/tmp/system-id` |
 | Imix binary | `/bin/imix`, `/usr/bin/imix`, etc. |
+| Rust/imix strings in process binary | Enumerates `/proc`, resolves `/proc/<pid>/exe`, reads binary — requires root for cross-user processes |
 | Systemd service unit | `/usr/lib/systemd/system/imixsvc.service` (or custom name) |
 | SysVinit script | `/etc/init.d/imixsvc` (or custom name) |
 | Install staging files | `/tmp/systemd.service.j2`, `/tmp/svc.sh.j2` |
@@ -29,6 +31,7 @@ A cross-platform Python agent that detects and responds to the
 |---|---|
 | Host-ID beacon UUID | `/Users/Shared/system-id` |
 | Imix Mach-O binary | `/var/root/imix` (or custom name) |
+| Rust/imix strings in process binary | Enumerates via `ps`, resolves exe from argv[0], reads binary — best-effort without sudo |
 | LaunchDaemon plist | `/Library/LaunchDaemons/imixsvc.plist` (label `com.testing.*`) |
 | Install staging file | `/tmp/plist.j2` |
 
@@ -37,6 +40,7 @@ A cross-platform Python agent that detects and responds to the
 |---|---|
 | Host-ID beacon UUID | `C:\ProgramData\system-id` |
 | Imix PE binary | `C:\Windows\System32\imix.exe` (or custom name) |
+| Rust/imix strings in process binary | Enumerates via `psutil` (preferred) or WMIC, reads PE binary — system/SYSTEM processes may be skipped without Administrator |
 | Windows service | Service named `imix`, `imixsvc`, `golem`, `golemsvc` |
 | Registry key | `HKLM\SOFTWARE\Imix` → `system-id` value |
 
@@ -142,6 +146,15 @@ Required dependencies (installed automatically):
 
 - **Elevated privileges** (`root` / Administrator) are required for some checks
   (reading `/proc/<pid>/exe`, listing all services, deleting system files).
+- The **Rust/imix dependency string check** enumerates all running processes and
+  reads each unique executable binary. Without elevated privileges:
+  - **Linux** — `/proc/<pid>/exe` is unreadable for processes owned by other users;
+    those processes are silently skipped. Run as `root` for full coverage.
+  - **macOS** — exe path is inferred from `ps` argv[0]; most processes are covered
+    without `sudo`, but some system processes may report misleading paths.
+  - **Windows** — `psutil` raises `AccessDenied` for SYSTEM/other-user processes
+    (skipped gracefully); WMIC may omit `ExecutablePath` for protected processes
+    without Administrator. Run as Administrator for full coverage.
 - The tool is **read-only by default**; destructive operations only run when
   `--neutralize` or `--remove` is explicitly passed and confirmed.
 - Always test in a non-production environment first.

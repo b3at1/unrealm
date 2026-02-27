@@ -9,6 +9,8 @@ Checks:
       binary path fingerprints (label pattern: com.testing.*)
   5.  Loaded launchctl services with realm fingerprints
   6.  Temporary Jinja2 staging files  /tmp/plist.j2
+  7.  Process binaries containing embedded Rust/imix dependency strings
+      (rustc, gimli, addr2line, demangle) – indicates imix compiled binary
 """
 from __future__ import annotations
 
@@ -39,6 +41,9 @@ UUID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Rust crate strings embedded in imix binaries by the compiler/debug info
+RUST_IMIX_STRINGS: List[bytes] = [b"rustc", b"gimli", b"addr2line", b"demangle"]
+
 
 def _read_text(path: str) -> str:
     try:
@@ -64,6 +69,16 @@ def _is_macho(path: str) -> bool:
         return False
 
 
+def _binary_contains_rust_strings(path: str) -> bool:
+    """Return True if the binary at *path* contains all four Rust/imix strings."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        return all(s in data for s in RUST_IMIX_STRINGS)
+    except OSError:
+        return False
+
+
 def _ps_processes() -> List[dict]:
     try:
         out = subprocess.check_output(
@@ -76,10 +91,14 @@ def _ps_processes() -> List[dict]:
         parts = line.split(None, 2)
         if len(parts) < 2:
             continue
+        # argv[0] in the args column is typically the full path to the binary
+        args_field = parts[2] if len(parts) > 2 else ""
+        exe = args_field.split()[0] if args_field.split() else parts[1]
         procs.append({
             "pid": parts[0],
             "name": os.path.basename(parts[1]),
-            "cmdline": parts[2] if len(parts) > 2 else "",
+            "exe": exe,
+            "cmdline": args_field,
         })
     return procs
 
@@ -93,8 +112,35 @@ def check_processes(report: ScanReport) -> None:
                 severity=Severity.HIGH,
                 title=f"Realm implant process running: {proc['name']} (PID {proc['pid']})",
                 detail=f"cmdline: {proc['cmdline'][:200]}",
-                path=None,
+                path=proc.get("exe") or None,
                 extra={"pid": proc["pid"]},
+            ))
+
+
+def check_rust_imix_strings(report: ScanReport) -> None:
+    """
+    Detect process binaries that contain all four Rust/imix dependency strings:
+    'rustc', 'gimli', 'addr2line', 'demangle'.  The simultaneous presence of
+    all four is a strong indicator of an imix compiled binary regardless of
+    the process name.
+    """
+    seen_exes: set = set()
+    for proc in _ps_processes():
+        exe = proc.get("exe", "")
+        if not exe or exe in seen_exes:
+            continue
+        seen_exes.add(exe)
+        if _binary_contains_rust_strings(exe):
+            report.add(Finding(
+                category="process",
+                severity=Severity.HIGH,
+                title=f"Process binary contains Rust/imix dependency strings: {proc['name']} (PID {proc['pid']})",
+                detail=(
+                    f"Binary '{exe}' contains all of: "
+                    + ", ".join(s.decode() for s in RUST_IMIX_STRINGS)
+                ),
+                path=exe,
+                extra={"pid": proc["pid"], "exe": exe, "strings_matched": [s.decode() for s in RUST_IMIX_STRINGS]},
             ))
 
 
@@ -214,6 +260,7 @@ def check_staging_files(report: ScanReport) -> None:
 def scan(report: ScanReport) -> None:
     """Run all macOS-specific realm detection checks."""
     check_processes(report)
+    check_rust_imix_strings(report)
     check_host_id_file(report)
     check_binaries(report)
     check_launch_items(report)

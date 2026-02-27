@@ -11,6 +11,8 @@ Checks (in order):
   6.  Temporary Jinja2 staging files realm uses during installation
   7.  gRPC / HTTP C2 network connections (delegated to net_detector)
   8.  Eldritch shell replacement: /bin/sh → /bin/true  (post-neutralise check)
+  9.  Process binaries containing embedded Rust/imix dependency strings
+      (rustc, gimli, addr2line, demangle) – indicates imix compiled binary
 """
 from __future__ import annotations
 
@@ -58,6 +60,9 @@ UUID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Rust crate strings embedded in imix binaries by the compiler/debug info
+RUST_IMIX_STRINGS: List[bytes] = [b"rustc", b"gimli", b"addr2line", b"demangle"]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -74,6 +79,16 @@ def _is_elf(path: str) -> bool:
     try:
         with open(path, "rb") as fh:
             return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def _binary_contains_rust_strings(path: str) -> bool:
+    """Return True if the binary at *path* contains all four Rust/imix strings."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        return all(s in data for s in RUST_IMIX_STRINGS)
     except OSError:
         return False
 
@@ -290,11 +305,39 @@ def check_neutralised(report: ScanReport) -> None:
         pass
 
 
+def check_rust_imix_strings(report: ScanReport) -> None:
+    """
+    Detect process binaries that contain all four Rust/imix dependency strings:
+    'rustc', 'gimli', 'addr2line', 'demangle'.  The simultaneous presence of
+    all four is a strong indicator of an imix compiled binary regardless of
+    the process name.
+    """
+    seen_exes: set = set()
+    for proc in _process_list():
+        exe = proc["exe"]
+        if not exe or exe in seen_exes:
+            continue
+        seen_exes.add(exe)
+        if _binary_contains_rust_strings(exe):
+            report.add(Finding(
+                category="process",
+                severity=Severity.HIGH,
+                title=f"Process binary contains Rust/imix dependency strings: {proc['name']} (PID {proc['pid']})",
+                detail=(
+                    f"Binary '{exe}' contains all of: "
+                    + ", ".join(s.decode() for s in RUST_IMIX_STRINGS)
+                ),
+                path=exe,
+                extra={"pid": proc["pid"], "exe": exe, "strings_matched": [s.decode() for s in RUST_IMIX_STRINGS]},
+            ))
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def scan(report: ScanReport) -> None:
     """Run all Linux-specific realm detection checks."""
     check_processes(report)
+    check_rust_imix_strings(report)
     check_host_id_file(report)
     check_binaries(report)
     check_systemd_services(report)
