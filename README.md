@@ -47,6 +47,7 @@ A cross-platform Python agent that detects and responds to the
 ---
 
 ## Usage
+WARNING: remove doesn't actually remove files. Currently it just terminates them so remove the files yourself at your own risk!
 Some features require administrator/sudo so you'd want to run `sudo .venv/bin/python -m unrealm --remove` in that case.
 ```
 # Scan only (default)
