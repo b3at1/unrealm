@@ -18,10 +18,10 @@ classifiers = [
     "Topic :: Security",
 ]
 
-dependencies = []
-
-[project.optional-dependencies]
-full = ["psutil>=5.9"]
+dependencies = [
+    "psutil>=5.9",
+    "scapy>=2.5",
+]
 
 [project.scripts]
 unrealm = "unrealm.cli:main"

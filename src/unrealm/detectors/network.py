@@ -18,6 +18,10 @@ Phase 2 – OBSERVE_DURATION-second observation window (~60 s)
   • gRPC fingerprinting: all unique remote endpoints observed during
     the window are probed with an HTTP/2 client-preface (RFC 7540 §3.5).
     A valid SETTINGS frame back confirms HTTP/2 / gRPC transport.
+  • Live traffic capture (Scapy): TCP packets are decoded on the fly.
+    HTTP/2 HEADERS and DATA frames are scanned for Realm gRPC service
+    paths.  Any match emits an immediate HIGH finding without waiting
+    for the observation window to close.
 """
 from __future__ import annotations
 
@@ -25,6 +29,7 @@ import os
 import socket
 import statistics
 import subprocess
+import threading
 import time
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
@@ -159,6 +164,158 @@ def _probe_grpc(host: str, port: int) -> bool:
         return False
 
 
+def _scan_h2_frames(data: bytes) -> List[str]:
+    """
+    Walk HTTP/2 frames in *data* and return any Realm C2 service paths found
+    in HEADERS (type 0x01) or DATA (type 0x00) frame payloads.
+
+    In cleartext gRPC (h2c), the ``:path`` pseudo-header is HPACK
+    literal-encoded, so the path string appears verbatim as ASCII bytes
+    inside the HEADERS frame payload.  DATA frame payloads may also carry
+    path strings embedded in protobuf metadata or gRPC-Web trailers.
+    """
+    found: List[str] = []
+    # Skip past the 24-byte HTTP/2 client preface if present in this buffer
+    offset = 0
+    preface_idx = data.find(b"PRI * HTTP/2.0")
+    if preface_idx != -1:
+        offset = preface_idx + 24
+
+    while offset + 9 <= len(data):
+        f_len  = int.from_bytes(data[offset:offset + 3], "big")
+        f_type = data[offset + 3]
+        offset += 9
+        # Guard against corrupt / truncated frames
+        if f_len > 16_777_215 or offset + f_len > len(data):
+            break
+        if f_type in (0x00, 0x01):  # DATA or HEADERS
+            payload = data[offset:offset + f_len]
+            for path in GRPC_PATHS:
+                if path.encode() in payload and path not in found:
+                    found.append(path)
+        offset += f_len
+
+    return found
+
+
+def _sniff_realm_grpc(report: ScanReport, duration: float) -> None:
+    """
+    Passively capture all TCP traffic for *duration* seconds using Scapy and
+    flag any flow whose HTTP/2 or gRPC content contains a known Realm C2
+    service path (GRPC_PATHS).  Findings are emitted immediately when a
+    match is detected, without waiting for the observation window to close.
+
+    Per-flow TCP payloads are accumulated in memory.  Two complementary
+    detection signals are applied on every incoming packet:
+
+      (a) Raw byte scan – search the entire accumulated flow buffer for each
+          Realm path as a raw byte string.  Cleartext gRPC (h2c) encodes
+          ``:path`` as a literal ASCII string in HPACK, so the method name
+          always appears verbatim inside the HEADERS frame payload.
+
+      (b) Structured H2 frame scan via ``_scan_h2_frames`` – walks HTTP/2
+          frame boundaries and inspects HEADERS (0x01) and DATA (0x00)
+          frame payloads.  Catches paths embedded in protobuf metadata
+          fields or gRPC-Web trailers that span a frame-header boundary.
+
+    Requires ``scapy``.  Emits Severity.INFO when the library is absent or
+    when raw socket access is denied (root / CAP_NET_RAW required).
+    """
+    try:
+        from scapy.all import AsyncSniffer, IP, IPv6, TCP  # type: ignore
+    except ImportError:
+        report.add(Finding(
+            category="network",
+            severity=Severity.INFO,
+            title="Scapy not available – live gRPC traffic capture skipped",
+            detail=(
+                "Install scapy (pip install scapy) to enable passive in-flight "
+                "gRPC service-path detection during the observation window."
+            ),
+        ))
+        return
+
+    # (src_ip, src_port, dst_ip, dst_port) → accumulated TCP payload bytes
+    flow_bufs: Dict[Tuple[str, int, str, int], bytes] = defaultdict(bytes)
+    # Flows already flagged – suppress duplicate HIGH findings per flow
+    flagged: Set[Tuple[str, int, str, int]] = set()
+
+    def _check_and_flag(flow_key: Tuple[str, int, str, int]) -> None:
+        """Run both detection signals on the current buffer; emit HIGH if matched."""
+        if flow_key in flagged:
+            return
+        buf = flow_bufs[flow_key]
+        # (a) Fast raw scan
+        found = [p for p in GRPC_PATHS if p.encode() in buf]
+        # (b) Structured H2 frame scan for anything not caught above
+        for p in _scan_h2_frames(buf):
+            if p not in found:
+                found.append(p)
+        if not found:
+            return
+        flagged.add(flow_key)
+        src_ip, src_port, dst_ip, dst_port = flow_key
+        report.add(Finding(
+            category="network",
+            severity=Severity.HIGH,
+            title=(
+                f"Realm gRPC service paths in live traffic: "
+                f"{dst_ip}:{dst_port}"
+            ),
+            detail=(
+                f"Live packet capture detected Realm C2 gRPC service paths in "
+                f"traffic from {src_ip}:{src_port} \u2192 {dst_ip}:{dst_port}: "
+                f"{', '.join(found)}. "
+                f"The captured HTTP/2 stream contains Realm C2 method names, "
+                f"confirming active C2 communication."
+            ),
+            path=None,
+            extra={
+                "src":         f"{src_ip}:{src_port}",
+                "dst":         f"{dst_ip}:{dst_port}",
+                "realm_paths": found,
+            },
+        ))
+
+    def _pkt_cb(pkt) -> None:  # type: ignore[no-untyped-def]
+        try:
+            if not pkt.haslayer(TCP):
+                return
+            payload = bytes(pkt[TCP].payload)
+            if not payload:
+                return
+            if pkt.haslayer(IP):
+                src_ip, dst_ip = pkt[IP].src, pkt[IP].dst
+            elif pkt.haslayer(IPv6):
+                src_ip, dst_ip = pkt[IPv6].src, pkt[IPv6].dst
+            else:
+                return
+            flow_key: Tuple[str, int, str, int] = (
+                src_ip, int(pkt[TCP].sport), dst_ip, int(pkt[TCP].dport)
+            )
+            flow_bufs[flow_key] += payload
+            _check_and_flag(flow_key)
+        except Exception:
+            pass
+
+    try:
+        sniffer = AsyncSniffer(filter="tcp", prn=_pkt_cb, store=False)
+        sniffer.start()
+        time.sleep(duration)
+        sniffer.stop()
+    except Exception as exc:
+        report.add(Finding(
+            category="network",
+            severity=Severity.INFO,
+            title="Live gRPC traffic capture failed",
+            detail=(
+                f"Scapy AsyncSniffer error: {exc}. "
+                f"Raw socket access requires elevated privileges "
+                f"(root or CAP_NET_RAW)."
+            ),
+        ))
+
+
 # ── Observation window (beacon + persistence + gRPC) ─────────────────────────
 
 def _observation_scan(report: ScanReport) -> None:
@@ -167,6 +324,8 @@ def _observation_scan(report: ScanReport) -> None:
       1. Flag endpoints that reconnect at regular intervals (beaconing).
       2. Flag endpoints present in ≥80 % of snapshots (persistent C2 session).
       3. Probe all observed remote endpoints for HTTP/2 / gRPC transport.
+      4. Passively capture live TCP traffic (Scapy) concurrent with polling;
+         decode HTTP/2 / gRPC frames and flag Realm service paths immediately.
 
     Blocks for approximately OBSERVE_DURATION seconds.
     """
@@ -179,6 +338,15 @@ def _observation_scan(report: ScanReport) -> None:
     appearance_times: Dict[Tuple[str, int], List[float]] = defaultdict(list)
     prev: Set[Tuple[str, int]] = set()
     t0 = time.monotonic()
+
+    # ── Launch live gRPC sniffer concurrently with the polling loop ────────
+    sniffer_thread = threading.Thread(
+        target=_sniff_realm_grpc,
+        args=(report, float(OBSERVE_DURATION)),
+        daemon=True,
+        name="unrealm-grpc-sniffer",
+    )
+    sniffer_thread.start()
 
     for i in range(n_snapshots):
         snap = _collect_remote_endpoints()
@@ -195,6 +363,9 @@ def _observation_scan(report: ScanReport) -> None:
         prev = snap
         if i < n_snapshots - 1:
             time.sleep(POLL_INTERVAL)
+
+    # ── Wait for sniffer to finish before running post-window analysis ─────
+    sniffer_thread.join(timeout=OBSERVE_DURATION + 5)
 
     all_seen: Set[Tuple[str, int]] = set(snapshot_count)
 
@@ -277,6 +448,7 @@ def _observation_scan(report: ScanReport) -> None:
                 path=None,
                 extra={"remote_ip": rip, "remote_port": rport},
             ))
+
 
 
 # ── Instant snapshot checks ───────────────────────────────────────────────────

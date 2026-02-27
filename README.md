@@ -101,15 +101,27 @@ Surgically removes all detected artifacts.
 ## Installation
 
 ```bash
-# Minimal (stdlib only)
-pip install .
+# 1. Create and activate a virtual environment inside the unrealm folder
+python3 -m venv unrealm/.venv
+source unrealm/.venv/bin/activate   # Windows: unrealm\.venv\Scripts\activate
 
-# Full (psutil for richer process/network inspection)
-pip install ".[full]"
+# 2. Install the package and all dependencies
+pip install ./unrealm
 ```
 
-Requires **Python 3.9+**. No external dependencies are needed for basic scanning.
-`psutil` is optional but recommended for the most complete results.
+Requires **Python 3.9+**.
+
+Required dependencies (installed automatically):
+
+| Package | Purpose |
+|---|---|
+| `psutil >= 5.9` | Rich process and network connection enumeration |
+| `scapy >= 2.5` | Live TCP packet capture for in-flight gRPC service-path detection |
+
+> **Note:** live packet capture (`scapy`) requires elevated privileges — run as
+> `root` on Linux/macOS or as Administrator on Windows, or grant
+> `CAP_NET_RAW` to the Python executable. Without root the sniffer step will
+> be skipped and a `Severity.INFO` finding will be emitted instead.
 
 ---
 
