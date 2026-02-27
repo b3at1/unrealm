@@ -49,6 +49,8 @@ GRPC_PROBE_TIMEOUT = 2.0    # seconds for HTTP/2 handshake response
 _H2_PREFACE  = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 # Empty SETTINGS frame: length=0, type=0x04, flags=0x00, stream-id=0
 _H2_SETTINGS = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+# Tonic Rust gRPC client user-agent prefix
+_TONIC_MARKER = b"tonic"
 
 # Realm gRPC service paths
 GRPC_PATHS = (
@@ -164,10 +166,12 @@ def _probe_grpc(host: str, port: int) -> bool:
         return False
 
 
-def _scan_h2_frames(data: bytes) -> List[str]:
+def _scan_h2_frames(data: bytes) -> Tuple[List[str], bool]:
     """
-    Walk HTTP/2 frames in *data* and return any Realm C2 service paths found
-    in HEADERS (type 0x01) or DATA (type 0x00) frame payloads.
+    Walk HTTP/2 frames in *data* and return ``(realm_paths, tonic_ua)`` where
+    *realm_paths* is the list of Realm C2 service paths found in HEADERS
+    (type 0x01) or DATA (type 0x00) frame payloads, and *tonic_ua* is True if
+    any HEADERS frame payload contains the ``tonic`` user-agent marker.
 
     In cleartext gRPC (h2c), the ``:path`` pseudo-header is HPACK
     literal-encoded, so the path string appears verbatim as ASCII bytes
@@ -175,6 +179,7 @@ def _scan_h2_frames(data: bytes) -> List[str]:
     path strings embedded in protobuf metadata or gRPC-Web trailers.
     """
     found: List[str] = []
+    tonic_ua = False
     # Skip past the 24-byte HTTP/2 client preface if present in this buffer
     offset = 0
     preface_idx = data.find(b"PRI * HTTP/2.0")
@@ -193,9 +198,11 @@ def _scan_h2_frames(data: bytes) -> List[str]:
             for path in GRPC_PATHS:
                 if path.encode() in payload and path not in found:
                     found.append(path)
+            if f_type == 0x01 and _TONIC_MARKER in payload:  # HEADERS frames only
+                tonic_ua = True
         offset += f_len
 
-    return found
+    return found, tonic_ua
 
 
 def _sniff_realm_grpc(report: ScanReport, duration: float) -> None:
@@ -218,6 +225,12 @@ def _sniff_realm_grpc(report: ScanReport, duration: float) -> None:
           frame payloads.  Catches paths embedded in protobuf metadata
           fields or gRPC-Web trailers that span a frame-header boundary.
 
+      (c) Tonic user-agent detection – HEADERS frames are scanned for the
+          ``tonic`` Rust gRPC client user-agent string.  HTTP/2 POST
+          requests from Realm implants (built with the tonic crate) carry
+          a ``user-agent: tonic/<version>`` header; any match flags the
+          destination endpoint even when the ``:path`` is not yet known.
+
     Requires ``scapy``.  Emits Severity.INFO when the library is absent or
     when raw socket access is denied (root / CAP_NET_RAW required).
     """
@@ -237,45 +250,75 @@ def _sniff_realm_grpc(report: ScanReport, duration: float) -> None:
 
     # (src_ip, src_port, dst_ip, dst_port) → accumulated TCP payload bytes
     flow_bufs: Dict[Tuple[str, int, str, int], bytes] = defaultdict(bytes)
-    # Flows already flagged – suppress duplicate HIGH findings per flow
-    flagged: Set[Tuple[str, int, str, int]] = set()
+    # Per-signal flags – suppress duplicate findings of the same type per flow
+    flagged_paths: Set[Tuple[str, int, str, int]] = set()
+    flagged_tonic: Set[Tuple[str, int, str, int]] = set()
 
     def _check_and_flag(flow_key: Tuple[str, int, str, int]) -> None:
-        """Run both detection signals on the current buffer; emit HIGH if matched."""
-        if flow_key in flagged:
+        """Run all detection signals on the current buffer; emit findings if matched."""
+        if flow_key in flagged_paths and flow_key in flagged_tonic:
             return
         buf = flow_bufs[flow_key]
-        # (a) Fast raw scan
-        found = [p for p in GRPC_PATHS if p.encode() in buf]
-        # (b) Structured H2 frame scan for anything not caught above
-        for p in _scan_h2_frames(buf):
-            if p not in found:
-                found.append(p)
-        if not found:
-            return
-        flagged.add(flow_key)
         src_ip, src_port, dst_ip, dst_port = flow_key
-        report.add(Finding(
-            category="network",
-            severity=Severity.HIGH,
-            title=(
-                f"Realm gRPC service paths in live traffic: "
-                f"{dst_ip}:{dst_port}"
-            ),
-            detail=(
-                f"Live packet capture detected Realm C2 gRPC service paths in "
-                f"traffic from {src_ip}:{src_port} \u2192 {dst_ip}:{dst_port}: "
-                f"{', '.join(found)}. "
-                f"The captured HTTP/2 stream contains Realm C2 method names, "
-                f"confirming active C2 communication."
-            ),
-            path=None,
-            extra={
-                "src":         f"{src_ip}:{src_port}",
-                "dst":         f"{dst_ip}:{dst_port}",
-                "realm_paths": found,
-            },
-        ))
+
+        # Shared structured H2 scan – one pass yields both paths and tonic UA flag
+        h2_paths, h2_tonic = _scan_h2_frames(buf)
+
+        # ── (a)+(b) Realm gRPC path detection ─────────────────────────────
+        if flow_key not in flagged_paths:
+            found = [p for p in GRPC_PATHS if p.encode() in buf]
+            for p in h2_paths:
+                if p not in found:
+                    found.append(p)
+            if found:
+                flagged_paths.add(flow_key)
+                report.add(Finding(
+                    category="network",
+                    severity=Severity.HIGH,
+                    title=(
+                        f"Realm gRPC service paths in live traffic: "
+                        f"{dst_ip}:{dst_port}"
+                    ),
+                    detail=(
+                        f"Live packet capture detected Realm C2 gRPC service paths in "
+                        f"traffic from {src_ip}:{src_port} \u2192 {dst_ip}:{dst_port}: "
+                        f"{', '.join(found)}. "
+                        f"The captured HTTP/2 stream contains Realm C2 method names, "
+                        f"confirming active C2 communication."
+                    ),
+                    path=None,
+                    extra={
+                        "src":         f"{src_ip}:{src_port}",
+                        "dst":         f"{dst_ip}:{dst_port}",
+                        "realm_paths": found,
+                    },
+                ))
+
+        # ── (c) Tonic user-agent detection ────────────────────────────────
+        if flow_key not in flagged_tonic:
+            if h2_tonic or _TONIC_MARKER in buf:
+                flagged_tonic.add(flow_key)
+                sev = Severity.HIGH if dst_port == C2_GRPC_PORT else Severity.MEDIUM
+                report.add(Finding(
+                    category="network",
+                    severity=sev,
+                    title=(
+                        f"Tonic gRPC client user-agent detected: "
+                        f"{dst_ip}:{dst_port}"
+                    ),
+                    detail=(
+                        f"Live packet capture found the 'tonic' Rust gRPC client "
+                        f"user-agent in HTTP/2 traffic from "
+                        f"{src_ip}:{src_port} \u2192 {dst_ip}:{dst_port}. "
+                        f"Realm implants built with the tonic crate send a "
+                        f"'user-agent: tonic/<version>' header on every POST request."
+                    ),
+                    path=None,
+                    extra={
+                        "src": f"{src_ip}:{src_port}",
+                        "dst": f"{dst_ip}:{dst_port}",
+                    },
+                ))
 
     def _pkt_cb(pkt) -> None:  # type: ignore[no-untyped-def]
         try:
