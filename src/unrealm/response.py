@@ -27,8 +27,12 @@ Two response modes:
                 host-ID files removed, registry keys purged (Windows).
 
 Both modes write a plain-text action log so the operator can review what
-was done. All destructive operations are gated behind the caller's explicit
-approval (passed as a boolean flag); this module never prompts on its own.
+was done.  The remove() function prompts interactively per artifact unless
+auto_yes=True is supplied (equivalent to answering 'a' at the first prompt):
+
+  a  –  Yes to all remaining artifacts (approve everything from here on)
+  y  –  Yes to this artifact only
+  n  –  No, skip this artifact
 """
 from __future__ import annotations
 
@@ -619,6 +623,40 @@ def _neutralise_windows(result: RemediationResult) -> None:
         _set_ifeo_cmd(result)
 
 
+# ── Per-artifact prompt ───────────────────────────────────────────────────────
+
+def _prompt_removal(finding: Finding) -> tuple[bool, bool]:
+    """
+    Display a single finding and ask the user whether to remove it.
+
+    Returns ``(approved, approve_all)`` where:
+      approved     – True if this artifact should be removed.
+      approve_all  – True if the user chose 'a' (yes to all remaining).
+    """
+    print(f"\n  [{finding.severity.value}] {finding.category.upper()} – {finding.title}")
+    if finding.path:
+        print(f"  path: {finding.path}")
+    if finding.detail:
+        # Show a condensed single-line detail for context
+        detail_short = finding.detail[:120].rstrip()
+        if len(finding.detail) > 120:
+            detail_short += "…"
+        print(f"  {detail_short}")
+    while True:
+        try:
+            ans = input("  Remove? [a=yes-to-all / y=yes / n=no]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False, False
+        if ans == "a":
+            return True, True
+        if ans in ("y", "yes"):
+            return True, False
+        if ans in ("n", "no"):
+            return False, False
+        print("  Please enter  a  (yes to all),  y  (yes), or  n  (no).")
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def neutralise(report: ScanReport) -> RemediationResult:
@@ -651,24 +689,58 @@ def neutralise(report: ScanReport) -> RemediationResult:
     return result
 
 
-def remove(report: ScanReport) -> RemediationResult:
+def remove(report: ScanReport, auto_yes: bool = False) -> RemediationResult:
     """
-    Surgically remove all detected realm artifacts.
+    Surgically remove detected realm artifacts.
+
+    Unless *auto_yes* is True, each artifact is shown individually and the
+    user is prompted:
+
+      a  – yes to all remaining artifacts (approve everything from here on)
+      y  – yes to this artifact
+      n  – no, skip this artifact
+
+    Passing ``auto_yes=True`` (or ``--yes`` from the CLI) skips all prompts
+    and removes every artifact, equivalent to answering 'a' at the first one.
+
     Kills processes, disables services, deletes binaries and persistence files.
     """
     result = RemediationResult()
-    findings = report.findings
-    if not findings:
+    if not report.findings:
         result.skip("remove: no findings to act on")
+        return result
+
+    # ── Per-artifact approval ──────────────────────────────────────────────
+    if auto_yes:
+        approved = list(report.findings)
+    else:
+        approved: List[Finding] = []
+        approve_all = False
+        for f in report.findings:
+            if approve_all:
+                approved.append(f)
+                continue
+            ok, go_all = _prompt_removal(f)
+            if go_all:
+                approved.append(f)
+                approve_all = True
+            elif ok:
+                approved.append(f)
+        skipped = len(report.findings) - len(approved)
+        if skipped:
+            result.skip(f"remove: {skipped} artifact(s) skipped by user")
+
+    if not approved:
+        result.skip("remove: no artifacts approved for removal")
         return result
 
     system = platform.system()
     if system == "Linux":
-        _remove_linux(findings, result)
+        _remove_linux(approved, result)
     elif system == "Darwin":
-        _remove_macos(findings, result)
+        _remove_macos(approved, result)
     elif system == "Windows":
-        _remove_windows(findings, result)
+        _remove_windows(approved, result)
     else:
         result.skip(f"remove: unsupported platform {system}")
     return result

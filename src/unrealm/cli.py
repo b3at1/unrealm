@@ -222,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     action.add_argument("--remove",      action="store_true", help="Full removal after scan")
     action.add_argument("--restore",     action="store_true",
                         help="Restore prior neutralise (e.g. /bin/sh on Linux)")
-    p.add_argument("--yes",     action="store_true", help="Skip confirmation prompts")
+    p.add_argument("--yes",     action="store_true", help="Skip confirmation prompts (yes to all artifacts)")
     p.add_argument("--json",    action="store_true", help="Output report as JSON")
     p.add_argument("--output",  metavar="FILE",      help="Write report to FILE")
     p.add_argument("--quiet",   action="store_true", help="Suppress banner and info messages")
@@ -311,12 +311,9 @@ def main(argv=None) -> int:
     # ── Remove ────────────────────────────────────────────────────────────────
     if args.remove:
         print(_render_remove_info(report))
-        if _confirm("Apply FULL REMOVAL of all detected artifacts?", args.yes):
-            res = response.remove(report)
-            print(render_remediation_result(res))
-            return 1 if res.failed else 0
-        else:
-            print("  Removal skipped.")
+        res = response.remove(report, auto_yes=args.yes)
+        print(render_remediation_result(res))
+        return 1 if res.failed else 0
 
     return 0 if not report.has_detections() else 2  # 2 = detections but no action
 
@@ -396,10 +393,14 @@ def _render_remove_info(report: ScanReport) -> str:
     items = [f"    • [{f.category}] {f.title}" for f in report.findings]
     item_str = "\n".join(items)
     return (
-        f"\n{_RED}{_BOLD}  ⚠  FULL REMOVAL will act on the following artifacts:{_RESET}\n"
+        f"\n{_RED}{_BOLD}  ⚠  FULL REMOVAL detected artifacts – you will be prompted per artifact:{_RESET}\n"
         f"{_DIM}{item_str}{_RESET}\n"
         f"{_RED}  This is irreversible. Running processes will be killed,\n"
         f"  files deleted, and services disabled.{_RESET}\n"
+        f"{_YELLOW}  Respond to each artifact: "
+        f"{_BOLD}a{_RESET}{_YELLOW}=yes-to-all  "
+        f"{_BOLD}y{_RESET}{_YELLOW}=yes  "
+        f"{_BOLD}n{_RESET}{_YELLOW}=no{_RESET}\n"
     )
 
 
