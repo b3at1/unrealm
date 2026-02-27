@@ -43,7 +43,7 @@ A cross-platform Python agent that detects and responds to the
 ---
 
 ## Usage
-
+Some features require administrator/sudo so you'd want to run `sudo .venv/bin/python -m unrealm --remove` in that case.
 ```
 # Scan only (default)
 python -m unrealm
@@ -101,12 +101,15 @@ Surgically removes all detected artifacts.
 ## Installation
 
 ```bash
-# 1. Create and activate a virtual environment inside the unrealm folder
-python3 -m venv unrealm/.venv
-source unrealm/.venv/bin/activate   # Windows: unrealm\.venv\Scripts\activate
+# 1. Git clone the repo (or download the zip)
+git clone https://github.com/b3at1/unrealm.git
+# 2. Create and activate a virtual environment
+cd /unrealm
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
 # 2. Install the package and all dependencies
-pip install ./unrealm
+pip install .
 ```
 
 Requires **Python 3.9+**.
